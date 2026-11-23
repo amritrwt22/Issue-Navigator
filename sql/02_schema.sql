@@ -1,14 +1,16 @@
--- Navigator schema — six tables: repositories, issues, issue_comments,
--- pull_requests, issue_fixes, pr_files.
+-- Navigator schema — seven tables: repositories, ingest_jobs, issues,
+-- issue_comments, pull_requests, issue_fixes, pr_files.
 --
 -- What it holds: the history of FIXED issues. For each one, the issue text and
 -- its comments, the merged PR that fixed it, and the files that PR changed. That
 -- last list is the answer key: the files Navigator should have pointed at.
+-- Plus one row per ingest run, so a run can be followed and its failure recorded.
 --
 -- Shape: `repositories` is the root. Everything else points back to it, and
 -- issue ↔ PR is many-to-many through `issue_fixes`.
 --
---   repositories 1 ──< issues         ─┐
+--   repositories 1 ──< ingest_jobs
+--                1 ──< issues         ─┐
 --                1 ──< pull_requests  ─┴── issue_fixes
 --                      issues        1 ──< issue_comments
 --                      pull_requests 1 ──< pr_files
@@ -23,7 +25,7 @@
 
 -- Wipe the tables first, so running this file always rebuilds them from scratch.
 DROP TABLE IF EXISTS pr_files, issue_fixes, issue_comments, pull_requests, issues,
-                     repositories CASCADE;
+                     ingest_jobs, repositories CASCADE;
 
 
 -- One row per GitHub repository Navigator tracks. The root — everything else
@@ -33,6 +35,19 @@ DROP TABLE IF EXISTS pr_files, issue_fixes, issue_comments, pull_requests, issue
 -- can't reference across databases. The normalised names are the link instead.
 -- RepoLens keys its repositories on the same lowercased pair, so the same
 -- WHERE owner_norm = ... AND repo_norm = ... finds the repo in both databases.
+--
+-- synced_sha = is the history ready for briefings yet. It plays the role of
+-- RepoLens's commit_sha:
+--   first ingest:  NULL until a run succeeds, so nothing is briefed from half
+--                  a history
+--   later runs:    keeps the old value the whole time, and moves only if the new
+--                  run succeeds, so a failed run leaves the old history usable
+--   skipping:      a run that finds HEAD equal to synced_sha ends as 'skipped'.
+--                  Every stored fix is a merged PR, and a merge moves HEAD, so an
+--                  unmoved HEAD means there are no new fixed issues
+--
+-- Run state (in progress, failed) lives on ingest_jobs, because one column could
+-- not say "usable" and "the last attempt failed" at once.
 
 CREATE TABLE repositories (
     id          serial primary key,
@@ -41,8 +56,49 @@ CREATE TABLE repositories (
     owner_norm  text not null,        -- lowercased; GitHub treats names as
     repo_norm   text not null,        -- case-insensitive, so the key must too
 
+    synced_sha  text,                 -- HEAD at the last successful ingest; NULL = never
+    synced_at   timestamptz,          -- when that run STARTED, so a fix merged during
+                                      -- the run is fetched by the next one. Later it is
+                                      -- GitHub's since: filter for incremental sync
+
     UNIQUE (owner_norm, repo_norm)    -- one row per repo, so nvidia/Garak and
                                       -- NVIDIA/garak can't become two rows
+);
+
+
+-- One row per ingest run. status = where the run is, conclusion = how it ended.
+-- conclusion stays NULL until status reaches 'completed'.
+--   success    the history was fetched and stored
+--   skipped    HEAD hadn't moved since the last successful run, so nothing was fetched
+--   failure    something broke; error holds the reason
+--   cancelled  stopped by Ctrl-C, or swept up after a hard kill
+--
+-- Navigator is used through an API: a run is started, the client gets the job's
+-- id at once, and it polls this row. Nobody is watching a terminal, so the
+-- outcome, the counts and the reason for a failure are stored here, not printed.
+--
+-- The row is written and committed before the long fetch starts, so it survives
+-- a failed run and can say why. The full flow is in navigator/services/ingest.py.
+
+CREATE TABLE ingest_jobs (
+    id              serial primary key,
+    repository_id   integer not null references repositories(id) on delete cascade,
+
+    commit_sha      text not null,          -- the HEAD this run saw; it becomes the
+                                            -- repo's synced_sha if the run succeeds
+
+    status          text not null
+                    CHECK (status IN ('queued','in_progress','completed')),
+    conclusion      text                    -- NULL until completed
+                    CHECK (conclusion IN ('success','skipped','failure','cancelled')),
+
+    issues_kept     integer,                -- set on success only: the issues stored,
+    issues_dropped  integer,                -- and the ones the INGEST RULES dropped
+
+    error           text,                   -- why the run didn't succeed: set on failure
+                                            -- and cancelled, NULL otherwise
+    started_at      timestamptz,            -- NULL while queued
+    finished_at     timestamptz             -- NULL until completed
 );
 
 
@@ -173,8 +229,6 @@ CREATE TABLE pr_files (
 --   issue closed_at          the PR's merged_at is the moment that matters
 --   URLs                     built from owner + repo + number; derive, don't copy
 --   embeddings               arrive with history search, as a new column on issues
---   sync runs                re-fetching garak takes a few dozen requests at most;
---                            arrives with the nightly refresh
 
 
 -- ---------------------------------------------------------------------------
@@ -185,6 +239,7 @@ CREATE TABLE pr_files (
 -- lookup ingest makes:
 --
 --   repositories (id)                      repositories (owner_norm, repo_norm)
+--   ingest_jobs (id)
 --   issues (id)                            issues (repository_id, number)
 --   issue_comments (github_id)
 --   pull_requests (id)                     pull_requests (repository_id, number)
@@ -199,6 +254,10 @@ CREATE TABLE pr_files (
 --
 -- Not covered by anything above. Nothing is made yet; each waits for the query
 -- that needs it:
+--
+--   ingest_jobs (repository_id)            DEFERRED: a repo's latest run. The query
+--                                          arrives with the API's polling, and a few
+--                                          dozen rows scan faster than an index anyway
 --
 --   issue_fixes (pull_request_id)          DEFERRED: PR -> its issues. Nothing
 --                                          asks that yet
