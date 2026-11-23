@@ -14,7 +14,7 @@
 # FUNCTIONS
 #
 #   find_fix_prs     one issue -> the PRs that count as its fix, or [] to drop it
-#   human_comments   one issue -> its comments, without the bots'   (next to write)
+#   human_comments   one issue -> its comments, without the bots'
 #
 #
 # INGEST RULES: what ingest keeps from fetch_closed_issues(), and the value that decides
@@ -49,24 +49,21 @@
 #     Kept:        comments whose author is None. GitHub sends None when the account
 #                  has since been deleted; it is treated as a person's.
 #
-#   Rule 7: every file of a fix PR is saved, whatever its changeType
-#     Decided by:  nothing is filtered: all of pr["files"]["nodes"]. Added files too;
-#                  scoring, not ingest, decides which files were findable.
+#   Rule 7: an issue is dropped if one of its fix PRs changed more than 100 files
+#     Decided by:  pr["files"]["pageInfo"]["hasNextPage"] == True
+#     Why:         GitHub sent only the first 100 files, so part of the answer key is
+#                  missing and the issue could never be a fair test. Rare.
+#     Kept:        when a fix PR's file list is complete, ALL its files are saved,
+#                  whatever their changeType: added files, tests and docs too. Ingest
+#                  never filters files; scoring decides later which ones were findable.
 #
-#   Rule 8: an issue is dropped if its PR list, or a fix PR's file list, was cut
+#   Rule 8: an issue is dropped if more than 10 PRs are linked to it
 #     Decided by:  issue["closedByPullRequestsReferences"]["pageInfo"]["hasNextPage"] == True
-#                      (over 10 linked PRs: a fix PR could be among the missing ones)
-#                  pr["files"]["pageInfo"]["hasNextPage"] == True
-#                      (a fix PR changed over 100 files: some of its files are missing)
-#     Why:         either way the answer key would be incomplete, so the issue can never
-#                  be a fair test. Dropping it means nothing has to remember it later.
-#                  Both cases are rare.
+#     Why:         GitHub sent only the first 10 PRs, so the real fix could be among the
+#                  missing ones and the answer key would be incomplete. Rare.
+#
 #     Comments are different: only the first 100 are fetched, and that is accepted.
 #     They are context, not the answer key, so the query doesn't check if they were cut.
-#
-#   Rule 9: no time filter at ingest
-#     Everything that passes rules 1-8 is saved. "Use only history older than the issue
-#     being answered" is applied later, when history is read.
 #
 #   What gets saved for each kept issue:
 #     issues          number, title, body, labels, createdAt
@@ -102,7 +99,7 @@ def find_fix_prs(issue, owner, repo):
       1. Rule 2: not closed as completed                         -> []
       2. Rule 8: the issue's PR list was cut (over 10 PRs)       -> []
       3. Rules 3 and 4: keep the PRs that were merged, into this repo.
-      4. Rule 8: a fix PR's file list was cut (over 100 files)   -> []
+      4. Rule 7: a fix PR's file list was cut (over 100 files)   -> []
       5. Rule 5: return what's left. Empty means no real fix, so the issue is dropped.
 
     Pure: it reads one dict and returns a list. No GitHub, no database, so it can be
@@ -131,7 +128,7 @@ def find_fix_prs(issue, owner, repo):
         if merged and into_this_repo:
             fix_prs.append(pr)
 
-    # 4. Rule 8: a fix PR changed more than 100 files, so GitHub sent only the first 100.
+    # 4. Rule 7: a fix PR changed more than 100 files, so GitHub sent only the first 100.
     #    Part of the answer key is missing, so the issue could never be a fair test.
     #    Only fix PRs are checked: a cut list on a PR that isn't a fix doesn't matter.
     for pr in fix_prs:
@@ -141,3 +138,43 @@ def find_fix_prs(issue, owner, repo):
     # 5. Rule 5: what's left are the fix PRs. [] means no real fix (closed by hand, fixed
     #    by a commit pushed without a PR, or fixed only in another repo): drop the issue.
     return fix_prs
+
+
+def human_comments(issue):
+    """Return the issue's comments, without the ones bots wrote.
+
+    IN   issue   one issue dict from fetch_closed_issues(). Only this key is used:
+                   {"comments": {"nodes": [
+                      {"fullDatabaseId": "1859302231",
+                       "body":           "I can reproduce this ...",
+                       "createdAt":      "2023-05-03T08:00:00Z",
+                       "author":         {"__typename": "User"}},
+                      {"fullDatabaseId": "1859400000",
+                       "body":           "This issue has been automatically marked as stale ...",
+                       "createdAt":      "2023-06-03T08:00:00Z",
+                       "author":         {"__typename": "Bot"}},
+                      {...,
+                       "author":         None},                  (the account was deleted)
+                      ...]}}
+
+    OUT  list of the kept comments' dicts, exactly as GitHub sent them, in the same order:
+           [{"fullDatabaseId": "1859302231", ...}, {..., "author": None}]
+         [] if the issue has no comments, or only bot comments.
+
+    STEPS
+      1. Rule 6: keep every comment whose author isn't a bot. A comment whose author
+         is None (a deleted account) is kept.
+
+    Pure, like find_fix_prs: one dict in, one list out.
+    """
+    # 1. Rule 6. Bot comments (github-actions adding labels, stale-issue reminders) say
+    #    nothing about the code, so they are skipped.
+    #    author is None when the account has since been deleted. It is treated as a
+    #    person's comment, so it is kept. Checking for None first also stops
+    #    author["__typename"] from crashing on it.
+    kept = []
+    for comment in issue["comments"]["nodes"]:
+        author = comment["author"]
+        if author is None or author["__typename"] != "Bot":
+            kept.append(comment)
+    return kept
