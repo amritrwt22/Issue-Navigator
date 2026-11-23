@@ -3,6 +3,7 @@
 What it does:
   client()               an authenticated connection to GitHub, reused for every request
   graphql()              sends one query; raises if GitHub reports errors
+  fetch_head_sha()       the commit the repo's default branch points at (its HEAD)
   fetch_closed_issues()  pages through a repo's closed issues, everything nested inside
 
 It returns GitHub's data as plain dicts. It does NOT decide what to keep (ingest.py does
@@ -179,9 +180,52 @@ def graphql(gh, query, variables):
     return body["data"]
 
 
+# The query for HEAD: the commit the repo's default branch points at right now.
+# Ingest sends it first, before CLOSED_ISSUES_QUERY. If HEAD hasn't moved since the
+# last successful run, nothing was merged, so there are no new fixed issues and the
+# run is skipped. It costs 1 point.
+HEAD_SHA_QUERY = """
+query($owner: String!, $repo: String!) {
+  repository(owner: $owner, name: $repo) {
+    defaultBranchRef {          # the default branch, e.g. "master"
+      target { oid }            # the commit that branch points at: HEAD
+    }
+  }
+}
+"""
 
 
-# The one query ingest needs: a page of 25 closed issues, with everything Navigator
+def fetch_head_sha(gh, owner, repo):
+    """Return the sha of the commit the repo's default branch points at: its HEAD.
+
+    IN   gh      the client from client()
+         owner   "encode"
+         repo    "httpx"
+
+    OUT  str, the commit's 40-character sha, e.g. "4b8f6e8d0c...".
+         Ingest compares it with the repo's synced_sha to decide whether to skip.
+
+    STEPS
+      1. Send HEAD_SHA_QUERY with owner and repo.
+      2. Take the sha out of the response, four levels down.
+
+    Raises whatever graphql() raises (an unknown repo: GitHubError). A repo with no
+    commits at all has no default branch, so defaultBranchRef is None and step 2
+    raises TypeError. Such a repo has no history to ingest anyway.
+    """
+    # 1. Send the query.
+    #    data = {"repository": {"defaultBranchRef": {"target": {"oid": "4b8f6e8d0c..."}}}}
+    data = graphql(gh, HEAD_SHA_QUERY, {"owner": owner, "repo": repo})
+
+    # 2. Walk down to the sha:
+    #      data["repository"]           the repo
+    #          ["defaultBranchRef"]     its default branch
+    #          ["target"]               the commit that branch points at
+    #          ["oid"]                  that commit's sha
+    return data["repository"]["defaultBranchRef"]["target"]["oid"]
+
+
+# The main query ingest needs: a page of 25 closed issues, with everything Navigator
 # stores nested inside each. Sent once per page; only $cursor changes.
 # 25, not the maximum of 100: nested lists multiply (25 issues x 10 PRs x 100 files),
 # and smaller pages stay well under GitHub's 10-second limit per request.
