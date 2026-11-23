@@ -138,7 +138,7 @@ def start_job(conn, repo_id, commit_sha):
 
     IN   conn         an open psycopg connection; the caller commits
          repo_id      int, from get_or_create_repository()
-         commit_sha   str, the HEAD this run saw, from github.fetch_head_sha()
+         commit_sha   str, the HEAD this run saw, from fetch_history.fetch_head_sha()
 
     OUT  job_id   int, e.g. 12. The caller keeps it, to close this same row when the
                   run ends.
